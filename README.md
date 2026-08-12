@@ -8,9 +8,11 @@ Python application that bridges a USB UART device to a Telnet TCP port.
 - Telnet authentication is bypassed; a client can connect directly
 - Default Telnet TCP port is `23`
 - `--port` can override the listen port
-- One thread forwards UART data to the Telnet client
+- One bridge-lifetime thread continuously reads UART data and forwards it to the
+  Telnet client when one is connected
 - One thread forwards Telnet data to the UART
-- If no Telnet client is connected, UART receive data is dropped
+- If no Telnet client is connected, UART receive data is continuously drained and
+  dropped so stale data cannot accumulate in the device or OS receive buffers
 - One active Telnet client is served at a time
 - If a new Telnet client connects, the existing client connection is terminated and replaced by the new one
 

@@ -73,7 +73,9 @@ class UartTelnetBridge:
         self.active_client_socket: socket.socket | None = None
         self.active_client_addr: tuple[str, int] | None = None
         self.active_client_stop_event: threading.Event | None = None
+        self.active_client_ready_event: threading.Event | None = None
         self.active_client_thread: threading.Thread | None = None
+        self.uart_reader_thread: threading.Thread | None = None
         self.server_socket: socket.socket | None = None
         self.serial_handle = serial.Serial(
             port=self.serial_port_name,
@@ -98,6 +100,13 @@ class UartTelnetBridge:
             self.serial_port_name,
         )
 
+        self.uart_reader_thread = threading.Thread(
+            target=self.uart_reader_loop,
+            name="uart-reader",
+            daemon=True,
+        )
+        self.uart_reader_thread.start()
+
         try:
             while not self.shutdown_event.is_set():
                 try:
@@ -120,9 +129,12 @@ class UartTelnetBridge:
             previous_socket = self.active_client_socket
             previous_addr = self.active_client_addr
             previous_stop_event = self.active_client_stop_event
+            previous_ready_event = self.active_client_ready_event
 
             if previous_stop_event is not None:
                 previous_stop_event.set()
+            if previous_ready_event is not None:
+                previous_ready_event.clear()
             if previous_socket is not None:
                 try:
                     previous_socket.shutdown(socket.SHUT_RDWR)
@@ -140,15 +152,17 @@ class UartTelnetBridge:
                 )
 
             stop_event = threading.Event()
+            ready_event = threading.Event()
             session_thread = threading.Thread(
                 target=self.handle_client,
                 name=f"client-session-{client_addr[0]}:{client_addr[1]}",
-                args=(client_socket, client_addr, stop_event),
+                args=(client_socket, client_addr, stop_event, ready_event),
                 daemon=True,
             )
             self.active_client_socket = client_socket
             self.active_client_addr = client_addr
             self.active_client_stop_event = stop_event
+            self.active_client_ready_event = ready_event
             self.active_client_thread = session_thread
             session_thread.start()
 
@@ -157,16 +171,11 @@ class UartTelnetBridge:
         client_socket: socket.socket,
         client_addr: tuple[str, int],
         stop_event: threading.Event,
+        ready_event: threading.Event,
     ) -> None:
         logging.info("Telnet client connected from %s:%s", client_addr[0], client_addr[1])
         client_socket.settimeout(0.5)
         self.send_telnet_banner(client_socket)
-        uart_to_telnet = threading.Thread(
-            target=self.uart_to_telnet_loop,
-            name="uart-to-telnet",
-            args=(client_socket, stop_event),
-            daemon=True,
-        )
         telnet_to_uart = threading.Thread(
             target=self.telnet_to_uart_loop,
             name="telnet-to-uart",
@@ -174,20 +183,20 @@ class UartTelnetBridge:
             daemon=True,
         )
 
-        uart_to_telnet.start()
         telnet_to_uart.start()
+        ready_event.set()
 
         try:
             while not self.shutdown_event.is_set() and not stop_event.is_set():
                 time.sleep(0.1)
         finally:
+            ready_event.clear()
             stop_event.set()
             try:
                 client_socket.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             client_socket.close()
-            uart_to_telnet.join()
             telnet_to_uart.join()
             logging.info(
                 "Telnet client disconnected from %s:%s", client_addr[0], client_addr[1]
@@ -197,6 +206,7 @@ class UartTelnetBridge:
                     self.active_client_socket = None
                     self.active_client_addr = None
                     self.active_client_stop_event = None
+                    self.active_client_ready_event = None
                     self.active_client_thread = None
 
     def send_telnet_banner(self, client_socket: socket.socket) -> None:
@@ -215,25 +225,36 @@ class UartTelnetBridge:
         except OSError:
             pass
 
-    def uart_to_telnet_loop(
-        self, client_socket: socket.socket, stop_event: threading.Event
-    ) -> None:
-        while not self.shutdown_event.is_set() and not stop_event.is_set():
+    def uart_reader_loop(self) -> None:
+        """Continuously drain UART input and forward it to the active client."""
+        while not self.shutdown_event.is_set():
             try:
                 data = self.serial_handle.read(BUFFER_SIZE)
             except serial.SerialException as exc:
                 logging.error("UART read failed: %s", exc)
-                stop_event.set()
+                self.shutdown_event.set()
                 return
 
             if not data:
+                continue
+
+            with self.client_lock:
+                client_socket = self.active_client_socket
+                stop_event = self.active_client_stop_event
+                ready_event = self.active_client_ready_event
+
+            if (
+                client_socket is None
+                or stop_event is None
+                or ready_event is None
+                or not ready_event.is_set()
+            ):
                 continue
 
             try:
                 client_socket.sendall(data)
             except OSError:
                 stop_event.set()
-                return
 
     def telnet_to_uart_loop(
         self, client_socket: socket.socket, stop_event: threading.Event
@@ -268,12 +289,16 @@ class UartTelnetBridge:
         with self.client_lock:
             active_socket = self.active_client_socket
             active_stop_event = self.active_client_stop_event
+            active_ready_event = self.active_client_ready_event
             active_thread = self.active_client_thread
             self.active_client_socket = None
             self.active_client_addr = None
             self.active_client_stop_event = None
+            self.active_client_ready_event = None
             self.active_client_thread = None
 
+        if active_ready_event is not None:
+            active_ready_event.clear()
         if active_stop_event is not None:
             active_stop_event.set()
         if active_socket is not None:
@@ -284,6 +309,10 @@ class UartTelnetBridge:
             active_socket.close()
         if active_thread is not None and active_thread.is_alive():
             active_thread.join()
+        uart_reader_thread = self.uart_reader_thread
+        if uart_reader_thread is not None and uart_reader_thread.is_alive():
+            uart_reader_thread.join()
+        self.uart_reader_thread = None
         if self.server_socket is not None:
             try:
                 self.server_socket.close()

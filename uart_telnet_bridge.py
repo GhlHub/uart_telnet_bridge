@@ -221,9 +221,10 @@ class UartTelnetBridge:
 
             if previous_addr is not None:
                 logging.info(
-                    "Telnet client %s:%s disconnected in favor of %s:%s",
+                    "Telnet client %s:%s disconnected from UART %s in favor of %s:%s",
                     previous_addr[0],
                     previous_addr[1],
+                    self.serial_port_name,
                     client_addr[0],
                     client_addr[1],
                 )
@@ -250,7 +251,12 @@ class UartTelnetBridge:
         stop_event: threading.Event,
         ready_event: threading.Event,
     ) -> None:
-        logging.info("Telnet client connected from %s:%s", client_addr[0], client_addr[1])
+        logging.info(
+            "Telnet client connected from %s:%s to UART %s",
+            client_addr[0],
+            client_addr[1],
+            self.serial_port_name,
+        )
         client_socket.settimeout(0.5)
         self.send_telnet_banner(client_socket)
         telnet_to_uart = threading.Thread(
@@ -276,7 +282,10 @@ class UartTelnetBridge:
             client_socket.close()
             telnet_to_uart.join()
             logging.info(
-                "Telnet client disconnected from %s:%s", client_addr[0], client_addr[1]
+                "Telnet client disconnected from %s:%s and UART %s",
+                client_addr[0],
+                client_addr[1],
+                self.serial_port_name,
             )
             with self.client_lock:
                 if self.active_client_socket is client_socket:

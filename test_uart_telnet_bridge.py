@@ -92,6 +92,17 @@ class FakeSocket:
         self.send_event.set()
 
 
+class FakeClientSocket(FakeSocket):
+    def settimeout(self, _timeout: float) -> None:
+        pass
+
+    def shutdown(self, _how: int) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
 @dataclass
 class FakePortInfo:
     device: str
@@ -159,6 +170,37 @@ class UartReaderTests(unittest.TestCase):
         self.assertTrue(forwarded_read.wait(timeout=1))
         self.assertTrue(client_socket.send_event.wait(timeout=1))
         self.assertEqual(client_socket.sent, [b"forwarded"])
+
+
+class ClientLoggingTests(unittest.TestCase):
+    def test_connect_and_disconnect_logs_include_uart_name(self) -> None:
+        bridge = object.__new__(UartTelnetBridge)
+        bridge.serial_port_name = "COM3"
+        bridge.shutdown_event = threading.Event()
+        bridge.shutdown_event.set()
+        bridge.client_lock = threading.Lock()
+        bridge.active_client_socket = None
+        bridge.active_client_addr = None
+        bridge.active_client_stop_event = None
+        bridge.active_client_ready_event = None
+        bridge.active_client_thread = None
+
+        with self.assertLogs(level="INFO") as captured_logs:
+            bridge.handle_client(
+                FakeClientSocket(),
+                ("10.0.1.24", 60972),
+                threading.Event(),
+                threading.Event(),
+            )
+
+        self.assertIn(
+            "Telnet client connected from 10.0.1.24:60972 to UART COM3",
+            captured_logs.output[0],
+        )
+        self.assertIn(
+            "Telnet client disconnected from 10.0.1.24:60972 and UART COM3",
+            captured_logs.output[1],
+        )
 
 
 class GreedyBridgeTests(unittest.TestCase):

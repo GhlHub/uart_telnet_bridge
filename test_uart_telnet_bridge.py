@@ -1,8 +1,12 @@
 import queue
 import threading
+import time
 import unittest
+from dataclasses import dataclass
 
-from uart_telnet_bridge import UartTelnetBridge
+import serial
+
+from uart_telnet_bridge import GreedyUartTelnetBridge, UartTelnetBridge, parse_args
 
 
 class FakeSerial:
@@ -34,6 +38,50 @@ class FakeSerial:
             )
 
 
+class DisconnectingSerial:
+    def __init__(self) -> None:
+        self.is_open = True
+        self.closed = threading.Event()
+
+    def read(self, _size: int) -> bytes:
+        raise serial.SerialException("device disconnected")
+
+    def close(self) -> None:
+        self.is_open = False
+        self.closed.set()
+
+
+class ReattachedSerial:
+    def __init__(self) -> None:
+        self.is_open = True
+        self.read_event = threading.Event()
+
+    def read(self, _size: int) -> bytes:
+        self.read_event.set()
+        time.sleep(0.005)
+        return b""
+
+    def close(self) -> None:
+        self.is_open = False
+
+
+class ReconnectTestBridge(UartTelnetBridge):
+    def __init__(self) -> None:
+        self.serial_handles = [DisconnectingSerial(), ReattachedSerial()]
+        self.open_count = 0
+        super().__init__(
+            serial_port="COM3",
+            telnet_port=2300,
+            auto_reconnect=True,
+            reconnect_interval=0.01,
+        )
+
+    def open_serial(self) -> DisconnectingSerial | ReattachedSerial:
+        serial_handle = self.serial_handles[self.open_count]
+        self.open_count += 1
+        return serial_handle
+
+
 class FakeSocket:
     def __init__(self) -> None:
         self.sent: list[bytes] = []
@@ -42,6 +90,35 @@ class FakeSocket:
     def sendall(self, data: bytes) -> None:
         self.sent.append(data)
         self.send_event.set()
+
+
+@dataclass
+class FakePortInfo:
+    device: str
+
+
+class FakeBridge:
+    def __init__(
+        self,
+        serial_port: str,
+        telnet_port: int,
+        *,
+        auto_reconnect: bool,
+        reconnect_interval: float,
+    ) -> None:
+        self.serial_port_name = serial_port
+        self.telnet_port = telnet_port
+        self.auto_reconnect = auto_reconnect
+        self.reconnect_interval = reconnect_interval
+        self.started = threading.Event()
+        self.stopped = threading.Event()
+
+    def run(self) -> None:
+        self.started.set()
+        self.stopped.wait(timeout=1)
+
+    def close(self) -> None:
+        self.stopped.set()
 
 
 class UartReaderTests(unittest.TestCase):
@@ -82,6 +159,58 @@ class UartReaderTests(unittest.TestCase):
         self.assertTrue(forwarded_read.wait(timeout=1))
         self.assertTrue(client_socket.send_event.wait(timeout=1))
         self.assertEqual(client_socket.sent, [b"forwarded"])
+
+
+class GreedyBridgeTests(unittest.TestCase):
+    def test_assigns_stable_sequential_ports_and_adds_new_uarts(self) -> None:
+        available_devices = [FakePortInfo("COM10"), FakePortInfo("COM3")]
+        greedy_bridge = GreedyUartTelnetBridge(
+            first_telnet_port=2300,
+            poll_interval=0.01,
+            port_enumerator=lambda: available_devices,
+            bridge_factory=FakeBridge,
+        )
+        self.addCleanup(greedy_bridge.close)
+
+        greedy_bridge.discover_uarts()
+        self.assertEqual(
+            {
+                device: bridge.telnet_port
+                for device, bridge in greedy_bridge.bridges.items()
+            },
+            {"COM3": 2300, "COM10": 2301},
+        )
+        self.assertTrue(
+            all(bridge.auto_reconnect for bridge in greedy_bridge.bridges.values())
+        )
+
+        available_devices[:] = [FakePortInfo("COM3")]
+        greedy_bridge.discover_uarts()
+        available_devices[:] = [FakePortInfo("COM10"), FakePortInfo("COM3")]
+        greedy_bridge.discover_uarts()
+        self.assertEqual(greedy_bridge.bridges["COM10"].telnet_port, 2301)
+
+        available_devices.append(FakePortInfo("COM7"))
+        greedy_bridge.discover_uarts()
+        self.assertEqual(greedy_bridge.bridges["COM7"].telnet_port, 2302)
+
+    def test_reattaches_a_disconnected_uart(self) -> None:
+        bridge = ReconnectTestBridge()
+        reader_thread = threading.Thread(target=bridge.uart_reader_loop)
+        bridge.uart_reader_thread = reader_thread
+        reader_thread.start()
+        self.addCleanup(bridge.close)
+
+        disconnected_serial, reattached_serial = bridge.serial_handles
+        self.assertTrue(disconnected_serial.closed.wait(timeout=1))
+        self.assertTrue(reattached_serial.read_event.wait(timeout=1))
+        self.assertEqual(bridge.open_count, 2)
+
+    def test_greedy_cli_does_not_require_a_serial_port(self) -> None:
+        args = parse_args(["--greedy", "--port", "2300"])
+        self.assertTrue(args.greedy)
+        self.assertIsNone(args.serial_port)
+        self.assertEqual(args.port, 2300)
 
 
 if __name__ == "__main__":

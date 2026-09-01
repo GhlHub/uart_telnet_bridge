@@ -5,14 +5,18 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import socket
 import threading
 import time
+from collections.abc import Callable, Iterable
 
 import serial
+from serial.tools import list_ports
 
 
 DEFAULT_TELNET_PORT = 23
+DEFAULT_RECONNECT_INTERVAL = 5.0
 BUFFER_SIZE = 4096
 
 IAC = 255
@@ -64,11 +68,30 @@ def strip_telnet_commands(data: bytes) -> bytes:
     return bytes(output)
 
 
+def natural_port_sort_key(device: str) -> list[object]:
+    """Sort COM/tty names numerically (for example, COM3 before COM10)."""
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", device)
+    ]
+
+
 class UartTelnetBridge:
-    def __init__(self, serial_port: str, telnet_port: int) -> None:
+    def __init__(
+        self,
+        serial_port: str,
+        telnet_port: int,
+        *,
+        auto_reconnect: bool = False,
+        reconnect_interval: float = DEFAULT_RECONNECT_INTERVAL,
+    ) -> None:
         self.serial_port_name = serial_port
         self.telnet_port = telnet_port
+        self.auto_reconnect = auto_reconnect
+        self.reconnect_interval = reconnect_interval
+        self.reconnect_not_before = 0.0
         self.shutdown_event = threading.Event()
+        self.serial_lock = threading.Lock()
         self.client_lock = threading.Lock()
         self.active_client_socket: socket.socket | None = None
         self.active_client_addr: tuple[str, int] | None = None
@@ -77,7 +100,21 @@ class UartTelnetBridge:
         self.active_client_thread: threading.Thread | None = None
         self.uart_reader_thread: threading.Thread | None = None
         self.server_socket: socket.socket | None = None
-        self.serial_handle = serial.Serial(
+        self.serial_handle: serial.Serial | None = None
+        try:
+            self.serial_handle = self.open_serial()
+        except serial.SerialException:
+            if not self.auto_reconnect:
+                raise
+            self.reconnect_not_before = time.monotonic() + self.reconnect_interval
+            logging.warning(
+                "UART %s is unavailable; retrying every %.1f seconds",
+                self.serial_port_name,
+                self.reconnect_interval,
+            )
+
+    def open_serial(self) -> serial.Serial:
+        return serial.Serial(
             port=self.serial_port_name,
             baudrate=115200,
             bytesize=serial.EIGHTBITS,
@@ -86,6 +123,46 @@ class UartTelnetBridge:
             timeout=0.2,
             write_timeout=0.2,
         )
+
+    def reconnect_uart(self) -> serial.Serial | None:
+        """Open a detached UART, returning None when it is still unavailable."""
+        with self.serial_lock:
+            if self.serial_handle is not None:
+                return self.serial_handle
+            if time.monotonic() < self.reconnect_not_before:
+                return None
+            try:
+                serial_handle = self.open_serial()
+            except serial.SerialException as exc:
+                self.reconnect_not_before = (
+                    time.monotonic() + self.reconnect_interval
+                )
+                logging.debug(
+                    "UART %s is still unavailable: %s", self.serial_port_name, exc
+                )
+                return None
+            self.serial_handle = serial_handle
+
+        logging.info("Attached to UART %s", self.serial_port_name)
+        return serial_handle
+
+    def detach_uart(self, serial_handle: serial.Serial) -> None:
+        """Close serial_handle if it is still the bridge's current UART handle."""
+        with self.serial_lock:
+            if self.serial_handle is not serial_handle:
+                return
+            self.serial_handle = None
+            self.reconnect_not_before = time.monotonic() + self.reconnect_interval
+        try:
+            serial_handle.close()
+        except (OSError, serial.SerialException):
+            pass
+
+    def stop_active_client(self) -> None:
+        with self.client_lock:
+            stop_event = self.active_client_stop_event
+        if stop_event is not None:
+            stop_event.set()
 
     def run(self) -> None:
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -228,12 +305,35 @@ class UartTelnetBridge:
     def uart_reader_loop(self) -> None:
         """Continuously drain UART input and forward it to the active client."""
         while not self.shutdown_event.is_set():
+            serial_handle = self.serial_handle
+            if serial_handle is None:
+                if not self.auto_reconnect:
+                    self.shutdown_event.set()
+                    return
+                reconnect_delay = max(
+                    0.0, self.reconnect_not_before - time.monotonic()
+                )
+                if self.shutdown_event.wait(reconnect_delay):
+                    return
+                serial_handle = self.reconnect_uart()
+                if serial_handle is None:
+                    continue
+
             try:
-                data = self.serial_handle.read(BUFFER_SIZE)
+                data = serial_handle.read(BUFFER_SIZE)
             except serial.SerialException as exc:
-                logging.error("UART read failed: %s", exc)
-                self.shutdown_event.set()
-                return
+                logging.error("UART %s read failed: %s", self.serial_port_name, exc)
+                if not self.auto_reconnect:
+                    self.shutdown_event.set()
+                    return
+                self.detach_uart(serial_handle)
+                self.stop_active_client()
+                logging.warning(
+                    "UART %s detached; retrying every %.1f seconds",
+                    self.serial_port_name,
+                    self.reconnect_interval,
+                )
+                continue
 
             if not data:
                 continue
@@ -277,10 +377,17 @@ class UartTelnetBridge:
                 continue
 
             try:
-                self.serial_handle.write(uart_payload)
-                self.serial_handle.flush()
+                serial_handle = self.serial_handle
+                if serial_handle is None:
+                    logging.warning("UART %s is unavailable", self.serial_port_name)
+                    stop_event.set()
+                    return
+                serial_handle.write(uart_payload)
+                serial_handle.flush()
             except serial.SerialException as exc:
-                logging.error("UART write failed: %s", exc)
+                logging.error("UART %s write failed: %s", self.serial_port_name, exc)
+                if self.auto_reconnect:
+                    self.detach_uart(serial_handle)
                 stop_event.set()
                 return
 
@@ -319,17 +426,94 @@ class UartTelnetBridge:
             except OSError:
                 pass
             self.server_socket = None
-        if self.serial_handle.is_open:
-            self.serial_handle.close()
+        with self.serial_lock:
+            serial_handle = self.serial_handle
+            self.serial_handle = None
+        if serial_handle is not None and serial_handle.is_open:
+            serial_handle.close()
 
 
-def parse_args() -> argparse.Namespace:
+class GreedyUartTelnetBridge:
+    """Run one reconnecting Telnet bridge for every UART that is discovered."""
+
+    def __init__(
+        self,
+        first_telnet_port: int,
+        *,
+        poll_interval: float = DEFAULT_RECONNECT_INTERVAL,
+        port_enumerator: Callable[[], Iterable[object]] = list_ports.comports,
+        bridge_factory: Callable[..., UartTelnetBridge] = UartTelnetBridge,
+    ) -> None:
+        self.next_telnet_port = first_telnet_port
+        self.poll_interval = poll_interval
+        self.port_enumerator = port_enumerator
+        self.bridge_factory = bridge_factory
+        self.shutdown_event = threading.Event()
+        self.bridges: dict[str, UartTelnetBridge] = {}
+        self.bridge_threads: dict[str, threading.Thread] = {}
+
+    def discover_uarts(self) -> None:
+        devices = sorted(
+            {port.device for port in self.port_enumerator()}, key=natural_port_sort_key
+        )
+        for device in devices:
+            if device in self.bridges:
+                continue
+            if self.next_telnet_port > 65535:
+                logging.error(
+                    "Cannot assign a TCP port to UART %s: port range exhausted",
+                    device,
+                )
+                continue
+
+            telnet_port = self.next_telnet_port
+            self.next_telnet_port += 1
+            bridge = self.bridge_factory(
+                serial_port=device,
+                telnet_port=telnet_port,
+                auto_reconnect=True,
+                reconnect_interval=self.poll_interval,
+            )
+            thread = threading.Thread(
+                target=bridge.run,
+                name=f"bridge-{device}-{telnet_port}",
+                daemon=True,
+            )
+            self.bridges[device] = bridge
+            self.bridge_threads[device] = thread
+            logging.info("Assigned UART %s to Telnet port %s", device, telnet_port)
+            thread.start()
+
+    def run(self) -> None:
+        try:
+            while not self.shutdown_event.is_set():
+                self.discover_uarts()
+                self.shutdown_event.wait(self.poll_interval)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        self.shutdown_event.set()
+        for bridge in self.bridges.values():
+            bridge.close()
+        for thread in self.bridge_threads.values():
+            if thread.is_alive() and thread is not threading.current_thread():
+                thread.join()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Bridge a USB UART device to a Telnet TCP socket."
     )
     parser.add_argument(
         "serial_port",
+        nargs="?",
         help="UART device path such as /dev/ttyUSB0 or COM3",
+    )
+    parser.add_argument(
+        "--greedy",
+        action="store_true",
+        help="bridge every discovered UART, assigning sequential Telnet ports",
     )
     parser.add_argument(
         "--port",
@@ -343,7 +527,14 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.greedy and args.serial_port is not None:
+        parser.error("serial_port must be omitted when --greedy is used")
+    if not args.greedy and args.serial_port is None:
+        parser.error("serial_port is required unless --greedy is used")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+    return args
 
 
 def main() -> int:
@@ -353,7 +544,10 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
     )
 
-    bridge = UartTelnetBridge(serial_port=args.serial_port, telnet_port=args.port)
+    if args.greedy:
+        bridge = GreedyUartTelnetBridge(first_telnet_port=args.port)
+    else:
+        bridge = UartTelnetBridge(serial_port=args.serial_port, telnet_port=args.port)
     try:
         bridge.run()
     except KeyboardInterrupt:

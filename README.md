@@ -10,8 +10,9 @@ Python application that bridges a USB UART device to a Telnet TCP port.
 - `--port` can override the listen port
 - `--greedy` discovers every available UART and assigns consecutive Telnet ports,
   beginning with `--port`
-- Greedy bridges retain their port assignment if a UART disappears and retry that
-  UART every 5 seconds until it is available again
+- Greedy mode takes down a UART's Telnet listener when the UART disappears, while
+  retaining its port assignment; if the UART returns, its listener is recreated
+  on the same Telnet port
 - UARTs discovered after startup receive the next unused Telnet port
 - One bridge-lifetime thread continuously reads UART data and forwards it to the
   Telnet client when one is connected
@@ -55,5 +56,5 @@ python3 uart_telnet_bridge.py --greedy --port 2323
 
 For example, if the discovered UARTs are `/dev/ttyUSB0`, `/dev/ttyUSB1`, and
 `/dev/ttyUSB2`, they listen on ports `2323`, `2324`, and `2325`, respectively.
-If one is unplugged, its Telnet listener remains assigned and the UART is reopened
-when it becomes available again.
+If one is unplugged, its Telnet listener is taken down. When the same UART becomes
+available again, the listener is recreated on its previous Telnet port.

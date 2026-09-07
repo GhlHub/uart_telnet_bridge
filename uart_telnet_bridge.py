@@ -443,7 +443,7 @@ class UartTelnetBridge:
 
 
 class GreedyUartTelnetBridge:
-    """Run one reconnecting Telnet bridge for every UART that is discovered."""
+    """Run one Telnet bridge for every UART that is currently available."""
 
     def __init__(
         self,
@@ -458,6 +458,7 @@ class GreedyUartTelnetBridge:
         self.port_enumerator = port_enumerator
         self.bridge_factory = bridge_factory
         self.shutdown_event = threading.Event()
+        self.port_assignments: dict[str, int] = {}
         self.bridges: dict[str, UartTelnetBridge] = {}
         self.bridge_threads: dict[str, threading.Thread] = {}
 
@@ -465,18 +466,37 @@ class GreedyUartTelnetBridge:
         devices = sorted(
             {port.device for port in self.port_enumerator()}, key=natural_port_sort_key
         )
+        available_devices = set(devices)
+
+        for device in list(self.bridges):
+            if device in available_devices:
+                continue
+            bridge = self.bridges.pop(device)
+            thread = self.bridge_threads.pop(device)
+            logging.info(
+                "UART %s is unavailable; taking down Telnet port %s",
+                device,
+                bridge.telnet_port,
+            )
+            bridge.close()
+            if thread.is_alive() and thread is not threading.current_thread():
+                thread.join()
+
         for device in devices:
             if device in self.bridges:
                 continue
-            if self.next_telnet_port > 65535:
-                logging.error(
-                    "Cannot assign a TCP port to UART %s: port range exhausted",
-                    device,
-                )
-                continue
+            telnet_port = self.port_assignments.get(device)
+            if telnet_port is None:
+                if self.next_telnet_port > 65535:
+                    logging.error(
+                        "Cannot assign a TCP port to UART %s: port range exhausted",
+                        device,
+                    )
+                    continue
+                telnet_port = self.next_telnet_port
+                self.next_telnet_port += 1
+                self.port_assignments[device] = telnet_port
 
-            telnet_port = self.next_telnet_port
-            self.next_telnet_port += 1
             bridge = self.bridge_factory(
                 serial_port=device,
                 telnet_port=telnet_port,
@@ -490,7 +510,7 @@ class GreedyUartTelnetBridge:
             )
             self.bridges[device] = bridge
             self.bridge_threads[device] = thread
-            logging.info("Assigned UART %s to Telnet port %s", device, telnet_port)
+            logging.info("Attached UART %s to Telnet port %s", device, telnet_port)
             thread.start()
 
     def run(self) -> None:

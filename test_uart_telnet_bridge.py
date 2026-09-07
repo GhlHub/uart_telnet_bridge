@@ -226,15 +226,25 @@ class GreedyBridgeTests(unittest.TestCase):
             all(bridge.auto_reconnect for bridge in greedy_bridge.bridges.values())
         )
 
+        original_com10_bridge = greedy_bridge.bridges["COM10"]
         available_devices[:] = [FakePortInfo("COM3")]
         greedy_bridge.discover_uarts()
+        self.assertNotIn("COM10", greedy_bridge.bridges)
+        self.assertTrue(original_com10_bridge.stopped.is_set())
+        self.assertEqual(greedy_bridge.port_assignments["COM10"], 2301)
+
         available_devices[:] = [FakePortInfo("COM10"), FakePortInfo("COM3")]
         greedy_bridge.discover_uarts()
         self.assertEqual(greedy_bridge.bridges["COM10"].telnet_port, 2301)
+        self.assertIsNot(greedy_bridge.bridges["COM10"], original_com10_bridge)
 
         available_devices.append(FakePortInfo("COM7"))
         greedy_bridge.discover_uarts()
         self.assertEqual(greedy_bridge.bridges["COM7"].telnet_port, 2302)
+        self.assertEqual(
+            greedy_bridge.port_assignments,
+            {"COM3": 2300, "COM10": 2301, "COM7": 2302},
+        )
 
     def test_reattaches_a_disconnected_uart(self) -> None:
         bridge = ReconnectTestBridge()

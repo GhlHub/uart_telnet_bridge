@@ -30,42 +30,58 @@ ECHO = 1
 SUPPRESS_GO_AHEAD = 3
 
 
-def strip_telnet_commands(data: bytes) -> bytes:
-    """Remove Telnet negotiation commands from payload bytes."""
-    output = bytearray()
-    i = 0
-    while i < len(data):
-        byte = data[i]
-        if byte != IAC:
+class TelnetInputDecoder:
+    """Decode an NVT console stream, retaining state across TCP recv calls.
+
+    Emit CR immediately for interactive input. Suppress the following NVT NUL
+    or LF so one Enter produces one UART carriage return. Negotiation and
+    subnegotiation bytes are not UART data, even when fragmented by TCP.
+    This bridge does not negotiate Telnet BINARY mode.
+    """
+
+    def __init__(self) -> None:
+        self.state = "data"
+        self.after_cr = False
+
+    def feed(self, data: bytes) -> bytes:
+        output = bytearray()
+        for byte in data:
+            if self.state == "option":
+                self.state = "data"
+                continue
+            if self.state == "subneg":
+                if byte == IAC:
+                    self.state = "subneg_iac"
+                continue
+            if self.state == "subneg_iac":
+                self.state = "data" if byte == SE else "subneg"
+                continue
+            if self.state == "iac":
+                if byte in (DO, DONT, WILL, WONT):
+                    self.state = "option"
+                    continue
+                if byte == SB:
+                    self.state = "subneg"
+                    continue
+                self.state = "data"
+                if byte != IAC:
+                    continue
+            elif byte == IAC:
+                self.state = "iac"
+                continue
+
+            if self.after_cr:
+                self.after_cr = False
+                if byte in (0, 10):
+                    continue
             output.append(byte)
-            i += 1
-            continue
+            self.after_cr = byte == 13
+        return bytes(output)
 
-        if i + 1 >= len(data):
-            break
 
-        command = data[i + 1]
-        if command == IAC:
-            output.append(IAC)
-            i += 2
-            continue
-
-        if command in (DO, DONT, WILL, WONT):
-            i += 3
-            continue
-
-        if command == SB:
-            i += 2
-            while i + 1 < len(data):
-                if data[i] == IAC and data[i + 1] == SE:
-                    i += 2
-                    break
-                i += 1
-            continue
-
-        i += 2
-
-    return bytes(output)
+def strip_telnet_commands(data: bytes) -> bytes:
+    """Decode a complete NVT chunk; stream users must retain a decoder."""
+    return TelnetInputDecoder().feed(data)
 
 
 def natural_port_sort_key(device: str) -> list[object]:
@@ -368,6 +384,7 @@ class UartTelnetBridge:
     def telnet_to_uart_loop(
         self, client_socket: socket.socket, stop_event: threading.Event
     ) -> None:
+        decoder = TelnetInputDecoder()
         while not self.shutdown_event.is_set() and not stop_event.is_set():
             try:
                 data = client_socket.recv(BUFFER_SIZE)
@@ -381,7 +398,7 @@ class UartTelnetBridge:
                 stop_event.set()
                 return
 
-            uart_payload = strip_telnet_commands(data)
+            uart_payload = decoder.feed(data)
             if not uart_payload:
                 continue
 

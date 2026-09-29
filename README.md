@@ -17,6 +17,9 @@ Python application that bridges a USB UART device to a Telnet TCP port.
 - One bridge-lifetime thread continuously reads UART data and forwards it to the
   Telnet client when one is connected
 - One thread forwards Telnet data to the UART
+- Telnet input is decoded as a stream across TCP packet boundaries. `CR NUL`
+  and `CR LF` both produce one UART carriage return, without a trailing NUL
+  corrupting the next shell command. Telnet BINARY mode is not negotiated.
 - If no Telnet client is connected, UART receive data is continuously drained and
   dropped so stale data cannot accumulate in the device or OS receive buffers
 - One active Telnet client is served at a time
@@ -58,3 +61,25 @@ For example, if the discovered UARTs are `/dev/ttyUSB0`, `/dev/ttyUSB1`, and
 `/dev/ttyUSB2`, they listen on ports `2323`, `2324`, and `2325`, respectively.
 If one is unplugged, its Telnet listener is taken down. When the same UART becomes
 available again, the listener is recreated on its previous Telnet port.
+
+## Console carriage-return fix
+
+Older versions forwarded the NUL after a Telnet carriage return to the UART.
+On the KR260 BusyBox shell this displayed `~ # ?` and caused the following
+command to fail as `?command: not found`. Input decoding now retains state
+between socket reads, removes Telnet negotiation, and converts both `CR NUL`
+and `CR LF` into a single UART CR.
+
+Restart the bridge process after updating the script, then reconnect. No Linux
+or FPGA rebuild, or client `toggle crlf` workaround, is needed. The user confirmed
+correct operation on the KR260 Linux console after restarting the Windows-hosted
+bridge.
+
+Run the regression suite with:
+
+```sh
+python -m unittest -v
+```
+
+All ten tests passed, including split carriage-return sequences, fragmented
+Telnet negotiations, escaped IAC bytes, per-connection state, and UART forwarding.

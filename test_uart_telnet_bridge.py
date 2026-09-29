@@ -6,7 +6,60 @@ from dataclasses import dataclass
 
 import serial
 
-from uart_telnet_bridge import GreedyUartTelnetBridge, UartTelnetBridge, parse_args
+from uart_telnet_bridge import (
+    GreedyUartTelnetBridge, UartTelnetBridge, TelnetInputDecoder, parse_args,
+)
+
+
+class TelnetInputTests(unittest.TestCase):
+    def test_enter_encodings_and_fragmentation(self) -> None:
+        stream = b"echo one\r\0echo two\r\necho three\rnext\n"
+        expected = b"echo one\recho two\recho three\rnext\n"
+        for split in range(len(stream) + 1):
+            with self.subTest(split=split):
+                decoder = TelnetInputDecoder()
+                self.assertEqual(decoder.feed(stream[:split]) +
+                                 decoder.feed(stream[split:]), expected)
+
+    def test_commands_do_not_break_cr_padding_state(self) -> None:
+        stream = b"one\r\xff\xfd\x03\0two\r\xff\xfa\x18payload\xff\xffx\xff\xf0\nend"
+        decoder = TelnetInputDecoder()
+        self.assertEqual(b"".join(decoder.feed(bytes([b])) for b in stream),
+                         b"one\rtwo\rend")
+
+    def test_plain_cr_is_immediate_and_literal_iac_survives(self) -> None:
+        decoder = TelnetInputDecoder()
+        self.assertEqual(decoder.feed(b"one\r"), b"one\r")
+        self.assertEqual(decoder.feed(b"two\xff"), b"two")
+        self.assertEqual(decoder.feed(b"\xff\0"), b"\xff\0")
+        self.assertEqual(decoder.feed(b"\r\r\0"), b"\r\r")
+
+    def test_connection_state_is_not_shared(self) -> None:
+        first = TelnetInputDecoder()
+        first.feed(b"\xff\xfb")
+        self.assertEqual(TelnetInputDecoder().feed(b"echo ok\r\0"), b"echo ok\r")
+
+    def test_uart_loop_retains_decoder_between_receives(self) -> None:
+        class Client:
+            chunks = iter([b"one\r", b"\0two\r\xff", b"\xfd", b"\x03\n", b""])
+            def recv(self, _size):
+                return next(self.chunks)
+
+        class Uart:
+            def __init__(self):
+                self.output = bytearray()
+            def write(self, data):
+                self.output.extend(data)
+            def flush(self):
+                pass
+
+        bridge = object.__new__(UartTelnetBridge)
+        bridge.shutdown_event = threading.Event()
+        bridge.serial_handle = Uart()
+        stop = threading.Event()
+        bridge.telnet_to_uart_loop(Client(), stop)
+        self.assertEqual(bridge.serial_handle.output, b"one\rtwo\r")
+        self.assertTrue(stop.is_set())
 
 
 class FakeSerial:
